@@ -4,6 +4,8 @@ A lightweight React + TypeScript + Vite application for creating and managing pr
 
 The app runs entirely in the browser. It does not require a backend, database, login, or API configuration.
 
+The current version also includes an optional local SQLite API. When started with `npm run dev`, the Vite frontend and SQLite server run together. LocalStorage remains as an offline fallback if the API is unavailable.
+
 ## Requirements
 
 Install the following before running the application:
@@ -47,6 +49,13 @@ This installs React, Vite, TypeScript, Lucide icons, and the required type defin
 ```powershell
 npm run dev
 ```
+
+This starts:
+
+- Vite frontend at `http://localhost:5173/`
+- SQLite API at `http://localhost:3001/`
+
+The SQLite database file is created automatically at `data/candidates.sqlite`.
 
 Vite will display a local address similar to:
 
@@ -117,11 +126,19 @@ After running the build command:
 npm run preview
 ```
 
+To run only the SQLite API:
+
+```powershell
+npm run server
+```
+
 Open the local URL shown in the terminal.
 
 ## Data storage
 
 - Candidate records are saved using browser `localStorage`.
+- Candidate records are also persisted through the local SQLite API when the server is running.
+- The SQLite API stores each candidate as a structured JSON payload in `data/candidates.sqlite`.
 - Each candidate has a unique ID, so editing updates the existing record instead of creating a duplicate.
 - Draft forms are stored separately in `localStorage`.
 - Saved reports are available only in the same browser and device.

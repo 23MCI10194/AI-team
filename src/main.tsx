@@ -1,4 +1,4 @@
-import { StrictMode, useMemo, useRef, useState } from 'react'
+import { StrictMode, useEffect, useMemo, useRef, useState } from 'react'
 import { createRoot } from 'react-dom/client'
 import * as XLSX from 'xlsx'
 import { CalendarDays, Check, CirclePlus, FileDown, Flag, FolderKanban, Pencil, Printer, Save, Search, Settings2, ShieldCheck, Star, Target, Trash2, Upload, UserRound, BriefcaseBusiness, ArrowLeft, Eye, UserPlus, X, ArrowUpDown } from 'lucide-react'
@@ -29,20 +29,21 @@ function App() {
   const [sort, setSort] = useState<'name' | 'rating'>('name')
   const selected = candidates.find(c => c.id === selectedId)
   const update = <K extends keyof Report>(key: K, value: Report[K]) => setDraft(d => ({ ...d, [key]: value }))
-  const persist = (items: Candidate[]) => { try { setCandidates(items); localStorage.setItem('clyptus-candidates', JSON.stringify(items)); return true } catch { setNotice('Storage is full. Try using a smaller photo.'); return false } }
+  useEffect(() => { fetch('/api/candidates').then(response => response.ok ? response.json() : Promise.reject()).then((items: Candidate[]) => { if (items.length) { setCandidates(items); localStorage.setItem('clyptus-candidates', JSON.stringify(items)) } }).catch(() => { /* LocalStorage remains the offline fallback. */ }) }, [])
+  const persist = async (items: Candidate[]) => { try { setCandidates(items); localStorage.setItem('clyptus-candidates', JSON.stringify(items)) } catch { setNotice('Storage is full. Try using a smaller photo.'); return false } try { const response = await fetch('/api/candidates', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(items) }); if (!response.ok) throw new Error('SQLite API unavailable') } catch { setNotice('Saved locally. Start the SQLite server to sync this data.'); setTimeout(() => setNotice(''), 3200) } return true }
   const openNew = () => { setEditingId(null); setDraft(blankReport()); setView('form') }
   const openEdit = (candidate: Candidate) => { const { id: _id, updatedAt: _updated, ...report } = candidate; setEditingId(candidate.id); setDraft(report); setView('form') }
-  const saveCandidate = (asDraft = false) => {
+  const saveCandidate = async (asDraft = false) => {
     if (asDraft) { try { localStorage.setItem('clyptus-draft', JSON.stringify(draft)); setNotice('Draft saved locally') } catch { setNotice('Unable to save draft') } setTimeout(() => setNotice(''), 2600); return }
     const required: [keyof Report, string][] = [['name', 'candidate name'], ['designation', 'designation'], ['joining', 'date of joining'], ['experience', 'experience'], ['team', 'team / department'], ['reportDate', 'report date'], ['summary', 'overall summary']]
     const missing = required.find(([key]) => !String(draft[key]).trim())
     if (missing) { setNotice(`Please enter the ${missing[1]}.`); setTimeout(() => setNotice(''), 3000); return }
     const next: Candidate = { ...draft, designation: 'AI Intern', id: editingId || uid(), updatedAt: new Date().toISOString() }
     const items = editingId ? candidates.map(c => c.id === editingId ? next : c) : [next, ...candidates]
-    if (!persist(items)) return
+    if (!await persist(items)) return
     setSelectedId(next.id); setView('list'); setNotice(editingId ? 'Candidate updated successfully' : 'Candidate saved successfully'); setTimeout(() => setNotice(''), 2600)
   }
-  const removeCandidate = (candidate: Candidate) => { if (confirm(`Delete ${candidate.name}'s evaluation?`)) { persist(candidates.filter(c => c.id !== candidate.id)); if (selectedId === candidate.id) setSelectedId(''); setNotice('Candidate deleted'); setTimeout(() => setNotice(''), 2200) } }
+  const removeCandidate = async (candidate: Candidate) => { if (confirm(`Delete ${candidate.name}'s evaluation?`)) { await persist(candidates.filter(c => c.id !== candidate.id)); if (selectedId === candidate.id) setSelectedId(''); setNotice('Candidate deleted'); setTimeout(() => setNotice(''), 2200) } }
   const openDashboard = (candidate: Candidate) => { setSelectedId(candidate.id); setView('dashboard') }
   const importCandidates = async (file: File) => {
     try {
@@ -58,7 +59,7 @@ function App() {
       })
       rows.forEach(row => { const key = `${String(row[0]).trim().toLowerCase()}|${String(row[2]).trim().toLowerCase()}`; if (!existing.has(key)) { existing.add(key); imported.push({ ...blankReport(), name: String(row[0]).trim(), designation: 'AI Intern', phone: String(row[1] || '').trim(), email: String(row[2] || '').trim(), bloodGroup: String(row[3] || '').trim(), photo: photoLink(row[4]), rating: 0, technicalRating: 0, id: uid(), updatedAt: new Date().toISOString() }) } })
       if (!imported.length && updated.every((candidate, index) => candidate.photo === candidates[index].photo)) { setNotice('No new candidates or photos found in the workbook.'); setTimeout(() => setNotice(''), 2600); return }
-      if (persist([...imported, ...updated])) { setNotice(`${imported.length ? `${imported.length} candidate${imported.length === 1 ? '' : 's'} imported` : 'Candidate photos updated'} successfully`); setTimeout(() => setNotice(''), 3000) }
+      if (await persist([...imported, ...updated])) { setNotice(`${imported.length ? `${imported.length} candidate${imported.length === 1 ? '' : 's'} imported` : 'Candidate photos updated'} successfully`); setTimeout(() => setNotice(''), 3000) }
     } catch { setNotice('Could not read this workbook. Please choose a valid .xlsx file.'); setTimeout(() => setNotice(''), 3000) }
   }
   return <div className="app-shell">
