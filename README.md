@@ -4,7 +4,7 @@ A lightweight React + TypeScript + Vite application for creating and managing pr
 
 The app runs entirely in the browser. It does not require a backend, database, login, or API configuration.
 
-The current version also includes an optional local SQLite API. When started with `npm run dev`, the Vite frontend and SQLite server run together. LocalStorage remains as an offline fallback if the API is unavailable.
+The current version includes a local SQLite API for development and a Vercel production API for shared data. LocalStorage remains as an offline fallback if an API is unavailable.
 
 ## Requirements
 
@@ -56,6 +56,8 @@ This starts:
 - SQLite API at `http://localhost:3001/`
 
 The SQLite database file is created automatically at `data/candidates.sqlite`.
+
+For Vercel deployment, connect a Postgres provider from the Vercel Marketplace, such as Neon or Supabase. Vercel injects the database environment variables into the deployment, and `api/candidates.ts` stores candidate records in the hosted database. This is what makes data entered on a laptop available on a phone using the same deployed URL. Vercel’s current database integrations are provided through the Marketplace. See the [Vercel Postgres documentation](https://vercel.com/docs/postgres).
 
 Vite will display a local address similar to:
 

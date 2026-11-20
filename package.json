@@ -10,6 +10,7 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "@neondatabase/serverless": "^1.2.1",
     "@vitejs/plugin-react": "latest",
     "better-sqlite3": "latest",
     "cors": "latest",
@@ -26,8 +27,8 @@
     "@types/react": "latest",
     "@types/react-dom": "latest",
     "concurrently": "latest",
-    "typescript": "latest",
     "tsx": "latest",
+    "typescript": "latest",
     "vite": "latest"
   }
 }
