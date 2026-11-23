@@ -13,16 +13,14 @@
     "@neondatabase/serverless": "^1.2.1",
     "@vitejs/plugin-react": "latest",
     "better-sqlite3": "latest",
-    "cors": "latest",
     "express": "latest",
     "lucide-react": "latest",
     "react": "latest",
     "react-dom": "latest",
-    "xlsx": "^0.18.5"
+    "xlsx": "https://cdn.sheetjs.com/xlsx-0.20.3/xlsx-0.20.3.tgz"
   },
   "devDependencies": {
     "@types/better-sqlite3": "latest",
-    "@types/cors": "latest",
     "@types/express": "latest",
     "@types/react": "latest",
     "@types/react-dom": "latest",
