@@ -59,6 +59,15 @@ The SQLite database file is created automatically at `data/candidates.sqlite`.
 
 For Vercel deployment, connect a Postgres provider from the Vercel Marketplace, such as Neon or Supabase. Vercel injects the database environment variables into the deployment, and `api/candidates.ts` stores candidate records in the hosted database. This is what makes data entered on a laptop available on a phone using the same deployed URL. Vercel’s current database integrations are provided through the Marketplace. See the [Vercel Postgres documentation](https://vercel.com/docs/postgres).
 
+### Required settings for the Vercel deployment
+
+| Variable | Purpose |
+|---|---|
+| `DATABASE_URL` (or `POSTGRES_URL`) | Set automatically when you connect Neon/Postgres from the Vercel Marketplace. |
+| `APP_ACCESS_KEY` | Shared key that protects candidate data. The deployed API refuses all requests until this is set. Share it only with people who should see evaluations; they enter it once per browser. |
+
+Locally, `APP_ACCESS_KEY` is optional because the local API only accepts connections from this computer.
+
 Vite will display a local address similar to:
 
 ```text

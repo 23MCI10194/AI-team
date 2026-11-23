@@ -18,6 +18,51 @@ const blankReport = (): Report => ({ name: '', designation: '', phone: '', email
 const uid = () => crypto.randomUUID?.() || Math.random().toString(36).slice(2)
 const skillLibrary: Record<string, string[]> = { 'AI Engineering': ['Python', 'Machine Learning', 'Deep Learning', 'LLMs', 'Prompt Engineering', 'RAG', 'LangChain', 'Vector Databases'], Frontend: ['HTML', 'CSS', 'JavaScript', 'TypeScript', 'React', 'Next.js', 'Tailwind CSS', 'Accessibility'], Backend: ['Node.js', 'Python', 'Java', 'C#', '.NET', 'REST APIs', 'GraphQL', 'Microservices'], 'Hosting & DevOps': ['AWS', 'Azure', 'Google Cloud', 'Docker', 'Kubernetes', 'CI/CD', 'GitHub Actions', 'Linux'], Databases: ['PostgreSQL', 'MySQL', 'MongoDB', 'Redis', 'SQL Server', 'DynamoDB', 'Database Design', 'SQL'], General: ['Git', 'Agile', 'Testing', 'Communication', 'Business Analysis', 'System Design'] }
 
+const ACCESS_KEY_STORAGE = 'clyptus-access-key'
+const readAccessKey = () => { try { return localStorage.getItem(ACCESS_KEY_STORAGE) || '' } catch { return '' } }
+class LockedError extends Error {}
+// Every database call goes through here so the access key is always sent.
+const api = async (query = '', init: RequestInit = {}) => {
+  const headers = new Headers(init.headers)
+  const key = readAccessKey()
+  if (key) headers.set('x-access-key', key)
+  if (init.body) headers.set('Content-Type', 'application/json')
+  const response = await fetch(`/api/candidates${query}`, { ...init, headers })
+  if (response.status === 401) throw new LockedError('Access key required')
+  if (!response.ok) throw new Error(`API ${response.status}`)
+  return response
+}
+// Hosting limits each request to ~4.5 MB, so large uploads are split into batches.
+const MAX_BATCH_BYTES = 3_000_000
+const upsertInBatches = async (items: Candidate[]) => {
+  let batch: Candidate[] = [], size = 0, latest: Candidate[] = []
+  const flush = async () => { if (!batch.length) return; latest = await (await api('', { method: 'PUT', body: JSON.stringify(batch) })).json(); batch = []; size = 0 }
+  for (const item of items) {
+    const itemSize = JSON.stringify(item).length
+    if (size + itemSize > MAX_BATCH_BYTES) await flush()
+    batch.push(item); size += itemSize
+  }
+  await flush()
+  return latest
+}
+// Shrinks photos to a small JPEG so records stay well under storage and request limits.
+const PHOTO_MAX_SIDE = 480
+const shrinkPhoto = (src: string) => new Promise<string>(resolve => {
+  if (!src.startsWith('data:image') || src.length < 150_000) return resolve(src)
+  const image = new Image()
+  image.onload = () => {
+    const scale = Math.min(1, PHOTO_MAX_SIDE / Math.max(image.width, image.height))
+    const canvas = document.createElement('canvas')
+    canvas.width = Math.round(image.width * scale); canvas.height = Math.round(image.height * scale)
+    const context = canvas.getContext('2d')
+    if (!context) return resolve(src)
+    context.drawImage(image, 0, 0, canvas.width, canvas.height)
+    resolve(canvas.toDataURL('image/jpeg', 0.82))
+  }
+  image.onerror = () => resolve(src)
+  image.src = src
+})
+
 function App() {
   const [candidates, setCandidates] = useState<Candidate[]>(() => { try { return JSON.parse(localStorage.getItem('clyptus-candidates') || '[]').map((candidate: Candidate) => ({ ...candidate, designation: 'AI Intern' })) } catch { return [] } })
   const [view, setView] = useState<View>('list')
@@ -29,8 +74,38 @@ function App() {
   const [sort, setSort] = useState<'name' | 'rating'>('name')
   const selected = candidates.find(c => c.id === selectedId)
   const update = <K extends keyof Report>(key: K, value: Report[K]) => setDraft(d => ({ ...d, [key]: value }))
-  useEffect(() => { fetch('/api/candidates').then(response => response.ok ? response.json() : Promise.reject()).then(async (items: Candidate[]) => { if (items.length) { setCandidates(items); localStorage.setItem('clyptus-candidates', JSON.stringify(items)) } else { const localItems = JSON.parse(localStorage.getItem('clyptus-candidates') || '[]') as Candidate[]; if (localItems.length) await fetch('/api/candidates', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(localItems) }) } }).catch(() => { /* LocalStorage remains the offline fallback. */ }) }, [])
-  const persist = async (items: Candidate[]) => { try { setCandidates(items); localStorage.setItem('clyptus-candidates', JSON.stringify(items)) } catch { setNotice('Storage is full. Try using a smaller photo.'); return false } try { const response = await fetch('/api/candidates', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(items) }); if (!response.ok) throw new Error('SQLite API unavailable') } catch { setNotice('Saved locally. Start the SQLite server to sync this data.'); setTimeout(() => setNotice(''), 3200) } return true }
+  const [dbStatus, setDbStatus] = useState<'checking' | 'connected' | 'offline' | 'locked'>('checking')
+  const [keyRejected, setKeyRejected] = useState(false)
+  const cacheLocally = (items: Candidate[]) => { try { localStorage.setItem('clyptus-candidates', JSON.stringify(items)); return true } catch { return false } }
+  const flash = (message: string, ms = 2600) => { setNotice(message); setTimeout(() => setNotice(''), ms) }
+  const markFailure = (error: unknown) => setDbStatus(error instanceof LockedError ? 'locked' : 'offline')
+  const load = async (localItems: Candidate[]) => {
+    try {
+      let items: Candidate[] = await (await api()).json()
+      setDbStatus('connected'); setKeyRejected(false)
+      if (!items.length) {
+        // First connection: move candidates that were only stored in this browser into the database.
+        const pending = await Promise.all(localItems.filter(c => c?.id).map(async c => ({ ...c, photo: await shrinkPhoto(c.photo || '') })))
+        if (!pending.length) return
+        items = await upsertInBatches(pending)
+      }
+      setCandidates(items); cacheLocally(items)
+    } catch (error) { markFailure(error) }
+  }
+  useEffect(() => { load(candidates) }, [])
+  const unlock = async (key: string) => {
+    try { localStorage.setItem(ACCESS_KEY_STORAGE, key.trim()) } catch { /* key then lasts only for this page */ }
+    setKeyRejected(true) // cleared by load() if the key works
+    await load(candidates)
+  }
+  // Updates the screen and browser cache, then writes the change to the database.
+  const persist = async (items: Candidate[], sync: () => Promise<unknown>): Promise<'db' | 'local' | null> => {
+    setCandidates(items)
+    const cached = cacheLocally(items)
+    try { await sync(); setDbStatus('connected'); return 'db' }
+    catch (error) { markFailure(error); if (cached) return 'local'; flash('Could not save: database unavailable and browser storage is full.', 4000); return null }
+  }
+  const offlineNote = dbStatus === 'locked' ? ' (this device only: enter the access key to sync)' : ' (this device only: database unavailable)'
   const openNew = () => { setEditingId(null); setDraft(blankReport()); setView('form') }
   const openEdit = (candidate: Candidate) => { const { id: _id, updatedAt: _updated, ...report } = candidate; setEditingId(candidate.id); setDraft(report); setView('form') }
   const saveCandidate = async (asDraft = false) => {
@@ -38,12 +113,13 @@ function App() {
     const required: [keyof Report, string][] = [['name', 'candidate name'], ['designation', 'designation'], ['joining', 'date of joining'], ['experience', 'experience'], ['team', 'team / department'], ['reportDate', 'report date'], ['summary', 'overall summary']]
     const missing = required.find(([key]) => !String(draft[key]).trim())
     if (missing) { setNotice(`Please enter the ${missing[1]}.`); setTimeout(() => setNotice(''), 3000); return }
-    const next: Candidate = { ...draft, designation: 'AI Intern', id: editingId || uid(), updatedAt: new Date().toISOString() }
+    const next: Candidate = { ...draft, photo: await shrinkPhoto(draft.photo), designation: 'AI Intern', id: editingId || uid(), updatedAt: new Date().toISOString() }
     const items = editingId ? candidates.map(c => c.id === editingId ? next : c) : [next, ...candidates]
-    if (!await persist(items)) return
-    setSelectedId(next.id); setView('list'); setNotice(editingId ? 'Candidate updated successfully' : 'Candidate saved successfully'); setTimeout(() => setNotice(''), 2600)
+    const saved = await persist(items, () => api('', { method: 'POST', body: JSON.stringify(next) }))
+    if (!saved) return
+    setSelectedId(next.id); setView('list'); flash((editingId ? 'Candidate updated' : 'Candidate saved') + (saved === 'db' ? ' successfully' : offlineNote), saved === 'db' ? 2600 : 4000)
   }
-  const removeCandidate = async (candidate: Candidate) => { if (confirm(`Delete ${candidate.name}'s evaluation?`)) { await persist(candidates.filter(c => c.id !== candidate.id)); if (selectedId === candidate.id) setSelectedId(''); setNotice('Candidate deleted'); setTimeout(() => setNotice(''), 2200) } }
+  const removeCandidate = async (candidate: Candidate) => { if (confirm(`Delete ${candidate.name}'s evaluation?`)) { const saved = await persist(candidates.filter(c => c.id !== candidate.id), () => api(`?id=${encodeURIComponent(candidate.id)}`, { method: 'DELETE' })); if (selectedId === candidate.id) setSelectedId(''); if (saved) flash(saved === 'db' ? 'Candidate deleted' : `Candidate deleted${offlineNote}`, saved === 'db' ? 2200 : 4000) } }
   const openDashboard = (candidate: Candidate) => { setSelectedId(candidate.id); setView('dashboard') }
   const importCandidates = async (file: File) => {
     try {
@@ -59,14 +135,17 @@ function App() {
       })
       rows.forEach(row => { const key = `${String(row[0]).trim().toLowerCase()}|${String(row[2]).trim().toLowerCase()}`; if (!existing.has(key)) { existing.add(key); imported.push({ ...blankReport(), name: String(row[0]).trim(), designation: 'AI Intern', phone: String(row[1] || '').trim(), email: String(row[2] || '').trim(), bloodGroup: String(row[3] || '').trim(), photo: photoLink(row[4]), rating: 0, technicalRating: 0, id: uid(), updatedAt: new Date().toISOString() }) } })
       if (!imported.length && updated.every((candidate, index) => candidate.photo === candidates[index].photo)) { setNotice('No new candidates or photos found in the workbook.'); setTimeout(() => setNotice(''), 2600); return }
-      if (await persist([...imported, ...updated])) { setNotice(`${imported.length ? `${imported.length} candidate${imported.length === 1 ? '' : 's'} imported` : 'Candidate photos updated'} successfully`); setTimeout(() => setNotice(''), 3000) }
+      const changed = [...imported, ...updated.filter((candidate, index) => candidate !== candidates[index])]
+      const saved = await persist([...imported, ...updated], () => upsertInBatches(changed))
+      if (saved) flash(`${imported.length ? `${imported.length} candidate${imported.length === 1 ? '' : 's'} imported` : 'Candidate photos updated'}${saved === 'db' ? ' successfully' : offlineNote}`, 3000)
     } catch { setNotice('Could not read this workbook. Please choose a valid .xlsx file.'); setTimeout(() => setNotice(''), 3000) }
   }
   return <div className="app-shell">
-    <header className="topbar"><div className="brand"><span className="brand-mark">C</span><span>Clyptus<span className="brand-dot">.ai</span></span></div><div className="workspace-name">Employee evaluation workspace <span className="workspace-pill">Local</span></div><div className="toolbar">{view !== 'list' && <button className="button ghost" onClick={() => setView('list')}><ArrowLeft size={16}/> Candidate list</button>}{view === 'dashboard' && selected && <><button className="button secondary" onClick={() => openEdit(selected)}><Pencil size={16}/> Edit candidate</button><button className="button primary" onClick={() => window.print()}><FileDown size={16}/> Download PDF</button></>}</div></header>
+    <header className="topbar"><div className="brand"><span className="brand-mark">C</span><span>Clyptus<span className="brand-dot">.ai</span></span></div><div className="workspace-name">Employee evaluation workspace <span className={`workspace-pill ${dbStatus}`} title={dbStatus === 'offline' ? 'Database unavailable: changes are kept in this browser only' : undefined}>{dbStatus === 'connected' ? 'Database connected' : dbStatus === 'offline' ? 'Offline' : dbStatus === 'locked' ? 'Locked' : 'Connecting…'}</span></div><div className="toolbar">{view !== 'list' && <button className="button ghost" onClick={() => setView('list')}><ArrowLeft size={16}/> Candidate list</button>}{view === 'dashboard' && selected && <><button className="button secondary" onClick={() => openEdit(selected)}><Pencil size={16}/> Edit candidate</button><button className="button primary" onClick={() => window.print()}><FileDown size={16}/> Download PDF</button></>}</div></header>
     {view === 'list' && <CandidateList candidates={candidates} query={query} setQuery={setQuery} sort={sort} setSort={setSort} onAdd={openNew} onImport={importCandidates} onOpen={openDashboard} onEdit={openEdit} onDelete={removeCandidate}/>} 
-    {view === 'form' && <CandidateForm report={draft} update={update} editing={!!editingId} onSave={() => saveCandidate(false)} onDraft={() => saveCandidate(true)} onCancel={() => setView('list')}/>} 
+    {view === 'form' && <CandidateForm report={draft} update={update} editing={!!editingId} onSave={() => saveCandidate(false)} onDraft={() => saveCandidate(true)} onCancel={() => setView('list')} onError={message => flash(message, 3000)}/>} 
     {view === 'dashboard' && selected && <Dashboard report={selected} onBack={() => setView('list')} onEdit={() => openEdit(selected)}/>} 
+    {dbStatus === 'locked' && <AccessGate rejected={keyRejected} onSubmit={unlock}/>}
     {notice && <div className="toast"><Check size={16}/> {notice}</div>}
   </div>
 }
@@ -77,17 +156,24 @@ function CandidateList({ candidates, query, setQuery, sort, setSort, onAdd, onIm
   return <main className="list-page"><div className="list-hero"><div><p className="eyebrow">TEAM LEAD VIEW</p><h1>Candidate evaluations</h1><p>Manage employee reports and open an individual evaluation dashboard.</p></div><div className="list-hero-actions"><button className="button secondary" onClick={() => importRef.current?.click()}><Upload size={17}/> Import Excel</button><input ref={importRef} hidden type="file" accept=".xlsx,.xls,.csv" onChange={e => { const file = e.target.files?.[0]; if (file) onImport(file); e.currentTarget.value = '' }}/><button className="button primary add-candidate" onClick={onAdd}><UserPlus size={17}/> Add candidate</button></div></div><div className="list-toolbar"><div className="search-box"><Search size={17}/><input value={query} onChange={e => setQuery(e.target.value)} placeholder="Search candidates by name" /></div><button className="sort-button" onClick={() => setSort(sort === 'name' ? 'rating' : 'name')}><ArrowUpDown size={15}/> Sort by {sort === 'name' ? 'name' : 'rating'}</button><span className="candidate-total">{candidates.length} candidate{candidates.length === 1 ? '' : 's'}</span></div>{rows.length === 0 ? <div className="empty-state"><UserRound size={28}/><h2>{candidates.length ? 'No candidates found' : 'No candidates yet'}</h2><p>{candidates.length ? 'Try a different search.' : 'Import the workbook or add your first candidate to generate an evaluation dashboard.'}</p>{!candidates.length && <div className="empty-actions"><button className="button secondary" onClick={() => importRef.current?.click()}><Upload size={16}/> Import Excel</button><button className="button primary" onClick={onAdd}><CirclePlus size={16}/> Add candidate</button></div>}</div> : <div className="candidate-table-wrap"><table className="candidate-table"><thead><tr><th>Candidate</th><th>Designation</th><th>Experience</th><th>Working days</th><th>Team</th><th>Team lead rating</th><th>Actions</th></tr></thead><tbody>{rows.map(c => <tr key={c.id}><td><button className="candidate-name" onClick={() => onOpen(c)}>{c.photo ? <img src={c.photo}/> : <span className="table-avatar">{c.name.slice(0, 1).toUpperCase()}</span>}<strong>{c.name}</strong></button></td><td>AI Intern</td><td>{c.experience || '—'}</td><td>{workingDays(c.joining) || '—'}</td><td>{c.team || '—'}</td><td><span className="table-rating"><Star size={15} fill="currentColor"/> {c.rating ? `${c.rating.toFixed(1)} / 10` : 'Not rated'}</span></td><td><div className="row-actions"><button onClick={() => onOpen(c)} title="View report"><Eye size={15}/> View</button><button onClick={() => onEdit(c)} title="Edit candidate"><Pencil size={14}/></button><button className="delete-action" onClick={() => onDelete(c)} title="Delete candidate"><Trash2 size={14}/></button></div></td></tr>)}</tbody></table></div>}</main>
 }
 
-function CandidateForm({ report, update, editing, onSave, onDraft, onCancel }: { report: Report; update: <K extends keyof Report>(key: K, value: Report[K]) => void; editing: boolean; onSave: () => void; onDraft: () => void; onCancel: () => void }) {
+function CandidateForm({ report, update, editing, onSave, onDraft, onCancel, onError }: { report: Report; update: <K extends keyof Report>(key: K, value: Report[K]) => void; editing: boolean; onSave: () => void; onDraft: () => void; onCancel: () => void; onError: (message: string) => void }) {
   const fileRef = useRef<HTMLInputElement>(null)
-  const upload = (e: React.ChangeEvent<HTMLInputElement>) => { const file = e.target.files?.[0]; if (file) { const reader = new FileReader(); reader.onload = () => update('photo', String(reader.result)); reader.readAsDataURL(file) } }
+  const upload = (e: React.ChangeEvent<HTMLInputElement>) => { const file = e.target.files?.[0]; if (file) { const reader = new FileReader(); reader.onload = async () => update('photo', await shrinkPhoto(String(reader.result))); reader.onerror = () => onError('Could not read this photo. Please try a different image file.'); reader.readAsDataURL(file) } }
   const changeList = (key: 'capabilities' | 'skills' | 'worthPoints', i: number, value: string) => update(key, report[key].map((x, j) => j === i ? value : x))
   return <main className="form-page"><div className="form-top"><div><p className="eyebrow">{editing ? 'EDIT CANDIDATE' : 'NEW CANDIDATE'}</p><h1>{editing ? 'Edit candidate evaluation' : 'Add candidate evaluation'}</h1><p>Enter the Team Lead’s complete assessment. The dashboard is generated from these details.</p></div><button className="button ghost light-ghost" onClick={onCancel}><X size={16}/> Cancel</button></div><div className="evaluation-form">
     <FormSection title="Candidate information" icon={<UserRound/>}><div className="candidate-info-grid"><div className="photo-upload" onClick={() => fileRef.current?.click()}>{report.photo ? <img src={report.photo}/> : <><Upload size={22}/><span>Upload photo</span></>}<input ref={fileRef} hidden type="file" accept="image/*" onChange={upload}/></div><div className="field-grid"><Field label="Full name" value={report.name} onChange={v => update('name', v)} required/><Field label="Designation" value="AI Intern" onChange={() => {}} readOnly required/><Field label="Phone number" type="tel" value={report.phone} onChange={v => update('phone', v)}/><Field label="Email ID" type="email" value={report.email} onChange={v => update('email', v)}/><Field label="Blood group" value={report.bloodGroup} onChange={v => update('bloodGroup', v)} placeholder="e.g. O+"/><Field label="Date of joining" type="date" value={dateInputValue(report.joining)} onChange={v => update('joining', v)} required/><Field label="Total experience" value={report.experience} onChange={v => update('experience', v)} required/><Field label="Working days (calculated)" value={String(workingDays(report.joining) || 0)} onChange={() => {}} readOnly/><Field label="Team / department" value={report.team} onChange={v => update('team', v)} required/><Field label="Report date" type="date" value={dateInputValue(report.reportDate)} onChange={v => update('reportDate', v)} required/></div></div></FormSection>
     <div className="form-two-col"><FormSection title="Projects" icon={<FolderKanban/>}><div className="form-list">{report.projects.map((p, i) => <div className="form-project" key={i}><input value={p.name} onChange={e => update('projects', report.projects.map((x, j) => j === i ? { ...x, name: e.target.value } : x))} placeholder="Project name"/><select value={p.status} onChange={e => update('projects', report.projects.map((x, j) => j === i ? { ...x, status: e.target.value as Project['status'] } : x))}><option>Active</option><option>Completed</option><option>On Hold</option></select><button onClick={() => update('projects', report.projects.filter((_, j) => j !== i))}><Trash2 size={15}/></button></div>)}</div><AddButton onClick={() => update('projects', [...report.projects, { name: '', status: 'Active' }])}>Add project</AddButton></FormSection><FormSection title="Performance ratings" icon={<ShieldCheck/>}><RatingInput label="Team Lead Rating" value={report.rating} onChange={v => update('rating', v)}/><RatingInput label="Technical Rating" value={report.technicalRating} onChange={v => update('technicalRating', v)}/></FormSection></div>
-    <div className="form-two-col"><FormSection title="Capabilities" icon={<Settings2/>}><FormEditableList items={report.capabilities} onChange={(i, v) => changeList('capabilities', i, v)} onRemove={i => update('capabilities', report.capabilities.filter((_, j) => j !== i))}/><AddButton onClick={() => update('capabilities', [...report.capabilities, ''])}>Add capability</AddButton></FormSection><FormSection title="Skills" icon={<FolderKanban/>}><div className="form-skill-list">{report.skills.map((s, i) => <span className="form-skill"><input value={s} onChange={e => changeList('skills', i, e.target.value)} placeholder="Skill"/><button onClick={() => update('skills', report.skills.filter((_, j) => j !== i))}><X size={13}/></button></span>)}</div><AddButton onClick={() => update('skills', [...report.skills, ''])}>Add custom skill</AddButton><div className="skill-library"><div className="skill-library-label">Quick add predefined skills</div>{Object.entries(skillLibrary).map(([group, skills]) => <div className="skill-group" key={group}><span>{group}</span><div>{skills.map(skill => <button className={report.skills.includes(skill) ? 'selected' : ''} key={skill} onClick={() => update('skills', report.skills.includes(skill) ? report.skills : [...report.skills.filter(Boolean), skill])}>{report.skills.includes(skill) && <Check size={12}/>} {skill}</button>)}</div></div>)}</div></FormSection></div>
+    <div className="form-two-col"><FormSection title="Capabilities" icon={<Settings2/>}><FormEditableList items={report.capabilities} onChange={(i, v) => changeList('capabilities', i, v)} onRemove={i => update('capabilities', report.capabilities.filter((_, j) => j !== i))}/><AddButton onClick={() => update('capabilities', [...report.capabilities, ''])}>Add capability</AddButton></FormSection><FormSection title="Skills" icon={<FolderKanban/>}><div className="form-skill-list">{report.skills.map((s, i) => <span className="form-skill" key={i}><input value={s} onChange={e => changeList('skills', i, e.target.value)} placeholder="Skill"/><button onClick={() => update('skills', report.skills.filter((_, j) => j !== i))}><X size={13}/></button></span>)}</div><AddButton onClick={() => update('skills', [...report.skills, ''])}>Add custom skill</AddButton><div className="skill-library"><div className="skill-library-label">Quick add predefined skills</div>{Object.entries(skillLibrary).map(([group, skills]) => <div className="skill-group" key={group}><span>{group}</span><div>{skills.map(skill => <button className={report.skills.includes(skill) ? 'selected' : ''} key={skill} onClick={() => update('skills', report.skills.includes(skill) ? report.skills : [...report.skills.filter(Boolean), skill])}>{report.skills.includes(skill) && <Check size={12}/>} {skill}</button>)}</div></div>)}</div></FormSection></div>
     <FormSection title="Worth for projects" icon={<Target/>}><div className="worth-form-grid"><Field label="Project value percentage" type="number" value={String(report.worth)} onChange={v => update('worth', Math.max(0, Math.min(100, Number(v))))} suffix="%"/><div className="worth-category"><span>Value category</span><strong>{report.worth >= 75 ? 'High Value' : report.worth >= 45 ? 'Medium Value' : 'Needs Focus'}</strong></div></div><FormEditableList items={report.worthPoints} onChange={(i, v) => changeList('worthPoints', i, v)} onRemove={i => update('worthPoints', report.worthPoints.filter((_, j) => j !== i))}/><AddButton onClick={() => update('worthPoints', [...report.worthPoints, ''])}>Add contribution point</AddButton></FormSection>
     <FormSection title="Overall summary & recommendation" icon={<Star/>}><label className="textarea-label">Overall performance summary <textarea value={report.summary} onChange={e => update('summary', e.target.value)} placeholder="Write the overall performance summary..." /></label><div className="field-grid"><label className="field"><span>Recommendation</span><select value={report.recommendation} onChange={e => update('recommendation', e.target.value)}><option>Continue in current project</option><option>Assign to new projects</option><option>Continue / Assign to key projects</option><option>Needs improvement</option><option>Recommend for promotion consideration</option><option>Recommend additional training</option></select></label><Field label="Optional remarks" value={report.remarks} onChange={v => update('remarks', v)} /></div></FormSection>
   </div><div className="form-actions"><button className="button ghost light-ghost" onClick={onCancel}>Cancel</button><button className="button secondary" onClick={onDraft}><Save size={16}/> Save draft</button><button className="button primary" onClick={onSave}><Check size={16}/> {editing ? 'Save changes' : 'Save candidate'}</button></div></main>
+}
+
+function AccessGate({ rejected, onSubmit }: { rejected: boolean; onSubmit: (key: string) => Promise<void> }) {
+  const [key, setKey] = useState('')
+  const [busy, setBusy] = useState(false)
+  const submit = async (e: React.FormEvent) => { e.preventDefault(); if (!key.trim()) return; setBusy(true); await onSubmit(key); setBusy(false) }
+  return <div className="access-gate" role="dialog" aria-modal="true" aria-labelledby="access-title"><form className="access-card" onSubmit={submit}><ShieldCheck size={30}/><h2 id="access-title">Enter access key</h2><p>Candidate data is protected. Ask your administrator for the workspace access key.</p><input type="password" autoFocus autoComplete="current-password" value={key} onChange={e => setKey(e.target.value)} placeholder="Access key" aria-invalid={rejected}/>{rejected && !busy && <span className="access-error">That key was not accepted. Please try again.</span>}<button className="button primary" disabled={busy || !key.trim()}>{busy ? 'Checking…' : 'Unlock'}</button></form></div>
 }
 
 function FormSection({ title, icon, children }: { title: string; icon: React.ReactNode; children: React.ReactNode }) { return <section className="form-section"><div className="form-section-title"><span>{icon}</span><h2>{title}</h2></div>{children}</section> }
